@@ -9,6 +9,7 @@ import logging
 from getpass import getpass
 
 from .settings import config
+from .hub import get_host
 from . import errors
 from .dependencies import Dependencies
 
@@ -76,7 +77,8 @@ def conn(host=None, user=None, password=None, *, init_fun=None, reset=False, use
                         #encrypted-connection-options).
     """
     if not hasattr(conn, 'connection') or reset:
-        host = host if host is not None else config['database.host']
+        host_input = host if host is not None else config['database.host']
+        host = get_host(host_input)
         user = user if user is not None else config['database.user']
         password = password if password is not None else config['database.password']
         if user is None:  # pragma: no cover
@@ -85,7 +87,8 @@ def conn(host=None, user=None, password=None, *, init_fun=None, reset=False, use
             password = getpass(prompt="Please enter DataJoint password: ")
         init_fun = init_fun if init_fun is not None else config['connection.init_function']
         use_tls = use_tls if use_tls is not None else config['database.use_tls']
-        conn.connection = Connection(host, user, password, None, init_fun, use_tls)
+        conn.connection = Connection(host, user, password, None, init_fun, use_tls,
+                                        host_input=host_input)
     return conn.connection
 
 
@@ -104,7 +107,8 @@ class Connection:
     :param use_tls: TLS encryption option
     """
 
-    def __init__(self, host, user, password, port=None, init_fun=None, use_tls=None):
+    def __init__(self, host, user, password, port=None, init_fun=None, use_tls=None,
+                    host_input=None):
         if ':' in host:
             # the port in the hostname overrides the port argument
             host, port = host.split(':')
@@ -115,6 +119,7 @@ class Connection:
         if use_tls is not False:
             self.conn_info['ssl'] = use_tls if isinstance(use_tls, dict) else {'ssl': {}}
         self.conn_info['ssl_input'] = use_tls
+        self.conn_info['host_input'] = host_input
         self.init_fun = init_fun
         print("Connecting {user}@{host}:{port}".format(**self.conn_info))
         self._conn = None
@@ -143,22 +148,35 @@ class Connection:
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', '.*deprecated.*')
             try:
-                self._conn = client.connect(
-                    init_command=self.init_fun,
-                    sql_mode="NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
-                             "STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION",
-                    charset=config['connection.charset'],
-                    **{k: v for k, v in self.conn_info.items()
-                    if k != 'ssl_input'})
-            except client.err.InternalError:
-                self._conn = client.connect(
-                    init_command=self.init_fun,
-                    sql_mode="NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
-                             "STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION",
-                    charset=config['connection.charset'],
-                    **{k: v for k, v in self.conn_info.items()
-                    if not(k == 'ssl_input' or
-                    k == 'ssl' and self.conn_info['ssl_input'] is None)})
+                try:
+                    self._conn = client.connect(
+                        init_command=self.init_fun,
+                        sql_mode="NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
+                                "STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION",
+                        charset=config['connection.charset'],
+                        **{k: v for k, v in self.conn_info.items()
+                        if k not in ['ssl_input', 'host_input']})
+                except client.err.InternalError:
+                    self._conn = client.connect(
+                        init_command=self.init_fun,
+                        sql_mode="NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,"
+                                "STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION",
+                        charset=config['connection.charset'],
+                        **{k: v for k, v in self.conn_info.items()
+                        if not(k in ['ssl_input', 'host_input'] or
+                        k == 'ssl' and self.conn_info['ssl_input'] is None)})
+            except client.err.OperationalError:
+                if not self.is_connected:
+                    target = [int(v) if i == 1 else v
+                        for i, v in enumerate(
+                        get_host(self.conn_info['host_input']).split(':'))]
+                    target[1] = self.conn_info['port'] if len(target) == 1 else target[1]
+                    if (target[0] != self.conn_info['host'] or
+                            target[1] != self.conn_info['port']):
+                        self.conn_info['host'], self.conn_info['port'] = target
+                        self.connect()
+                    else:
+                        raise
         self._conn.autocommit(True)
 
     def close(self):
